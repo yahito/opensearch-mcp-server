@@ -1,5 +1,6 @@
 import logging
 from typing import List, Optional, Dict, Any
+import requests
 from opensearchpy import OpenSearch
 from opensearchpy.exceptions import ConnectionError, RequestError
 
@@ -13,21 +14,76 @@ logger = logging.getLogger(__name__)
 class OpenSearchService:
     def __init__(self, config: OpenSearchConfig):
         self.config = config
+        self.use_requests = config.use_cookies or config.auth_headers
         
-        # Create OpenSearch client
-        auth = None
-        if config.username and config.password:
-            auth = (config.username, config.password)
+        if self.use_requests:
+            # Use requests session for cookie/header support
+            self.session = requests.Session()
+            
+            # Set up authentication
+            if config.username and config.password and not config.use_cookies:
+                self.session.auth = (config.username, config.password)
+            
+            # Set up cookies
+            if config.use_cookies:
+                # Load from cookie file if specified
+                file_cookies = config.load_cookies_from_file()
+                if file_cookies:
+                    self.session.cookies.update(file_cookies)
+                
+                # Load from environment variable
+                env_cookies = config.parsed_cookies
+                if env_cookies:
+                    self.session.cookies.update(env_cookies)
+            
+            # Set up additional headers
+            auth_headers = config.parsed_auth_headers
+            if auth_headers:
+                self.session.headers.update(auth_headers)
+            
+            # Set default headers
+            self.session.headers.update({
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            })
+            
+            # SSL configuration
+            self.session.verify = config.verify_certs if config.use_ssl else False
+            
+            logger.info(f"Using requests session with cookies: {bool(config.use_cookies)}, headers: {bool(auth_headers)}")
+        else:
+            # Use standard OpenSearch client
+            auth = None
+            if config.username and config.password:
+                auth = (config.username, config.password)
+            
+            self.client = OpenSearch(
+                hosts=[{'host': config.host, 'port': config.port}],
+                http_auth=auth,
+                use_ssl=config.use_ssl,
+                verify_certs=config.verify_certs,
+                ssl_assert_hostname=False,
+                ssl_show_warn=False,
+                timeout=config.timeout_seconds
+            )
+            logger.info("Using standard OpenSearch client")
+    
+    def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+        """Make HTTP request using requests session (for cookie support)"""
+        url = f"{self.config.url}{endpoint}"
         
-        self.client = OpenSearch(
-            hosts=[{'host': config.host, 'port': config.port}],
-            http_auth=auth,
-            use_ssl=config.use_ssl,
-            verify_certs=config.verify_certs,
-            ssl_assert_hostname=False,
-            ssl_show_warn=False,
-            timeout=config.timeout_seconds
-        )
+        try:
+            response = self.session.request(
+                method=method,
+                url=url,
+                timeout=self.config.timeout_seconds,
+                **kwargs
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"HTTP request failed: {e}")
+            raise RequestError(f"Request failed: {e}")
     
     def search(self, index: str, query: Dict[str, Any], size: Optional[int] = None) -> SearchResponse:
         """Execute a search query against an OpenSearch index"""
@@ -40,11 +96,25 @@ class OpenSearchService:
             raise ValueError("query is required")
         
         try:
-            response = self.client.search(
-                index=index,
-                body=query,
-                size=size or 10
-            )
+            if self.use_requests:
+                # Use requests session for cookie support
+                params = {}
+                if size:
+                    params['size'] = size or 10
+                
+                response = self._make_request(
+                    'POST',
+                    f'/{index}/_search',
+                    json=query,
+                    params=params
+                )
+            else:
+                # Use standard OpenSearch client
+                response = self.client.search(
+                    index=index,
+                    body=query,
+                    size=size or 10
+                )
             
             return self._parse_search_response(response)
             
@@ -135,8 +205,12 @@ class OpenSearchService:
             raise ValueError("doc_id is required")
         
         try:
-            response = self.client.get(index=index, id=doc_id)
-            return response["_source"]
+            if self.use_requests:
+                response = self._make_request('GET', f'/{index}/_doc/{doc_id}')
+                return response["_source"]
+            else:
+                response = self.client.get(index=index, id=doc_id)
+                return response["_source"]
         except Exception as e:
             logger.error(f"Error getting document: {e}")
             raise
@@ -146,7 +220,11 @@ class OpenSearchService:
         logger.info("Getting all indices information")
         
         try:
-            response = self.client.cat.indices(format="json", v=True)
+            if self.use_requests:
+                response = self._make_request('GET', '/_cat/indices', params={'format': 'json', 'v': 'true'})
+            else:
+                response = self.client.cat.indices(format="json", v=True)
+            
             indices = []
             
             for index_data in response:
@@ -175,7 +253,10 @@ class OpenSearchService:
         logger.info("Getting cluster health")
         
         try:
-            response = self.client.cluster.health()
+            if self.use_requests:
+                response = self._make_request('GET', '/_cluster/health')
+            else:
+                response = self.client.cluster.health()
             
             return ClusterHealth(
                 cluster_name=response.get("cluster_name", ""),
@@ -207,7 +288,10 @@ class OpenSearchService:
             raise ValueError("index is required")
         
         try:
-            response = self.client.indices.get_mapping(index=index)
+            if self.use_requests:
+                response = self._make_request('GET', f'/{index}/_mapping')
+            else:
+                response = self.client.indices.get_mapping(index=index)
             return response
         except Exception as e:
             logger.error(f"Error getting index mapping: {e}")
